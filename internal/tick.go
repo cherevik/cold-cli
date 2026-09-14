@@ -794,7 +794,14 @@ func extractRFCMessageID(msg *GWSMessage) string {
 	if msg == nil || msg.Headers == nil {
 		return ""
 	}
-	return strings.TrimSpace(msg.Headers["Message-ID"])
+	// Header names are case-insensitive; Gmail returns "Message-Id" for
+	// messages it generates its own ID for.
+	for name, value := range msg.Headers {
+		if strings.EqualFold(name, "Message-ID") {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 // FormatTickResult returns a human-readable summary of a tick result.
