@@ -2,9 +2,13 @@ package internal
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"math/rand"
+	"mime"
+	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -14,9 +18,20 @@ import (
 
 // Sequence represents a parsed sequence YAML file.
 type Sequence struct {
-	Name     string           `yaml:"name"`
-	Defaults SequenceDefaults `yaml:"defaults"`
-	Steps    []SequenceStep   `yaml:"steps"`
+	Name         string           `yaml:"name"`
+	Defaults     SequenceDefaults `yaml:"defaults"`
+	Steps        []SequenceStep   `yaml:"steps"`
+	InlineImages []InlineImage    `yaml:"inline_images,omitempty"`
+}
+
+// InlineImage is an image embedded in HTML steps via <img src="cid:CID">.
+// Path is resolved relative to the sequence file when parsing from disk;
+// Data holds the base64 payload so stored sequences are self-contained.
+type InlineImage struct {
+	CID         string `yaml:"cid"`
+	Path        string `yaml:"path,omitempty"`
+	ContentType string `yaml:"content_type,omitempty"`
+	Data        string `yaml:"data,omitempty"`
 }
 
 type SequenceDefaults struct {
@@ -28,12 +43,32 @@ type SequenceStep struct {
 	Delay    int               `yaml:"delay"` // days after previous step
 	Subject  string            `yaml:"subject"`
 	Body     string            `yaml:"body"`
-	Variants []SequenceVariant `yaml:"variants"`
+	Format   string            `yaml:"format,omitempty"` // markdown (default), html, or text
+	HTML     bool              `yaml:"html,omitempty"`   // legacy alias for format: html
+	Variants []SequenceVariant `yaml:"variants,omitempty"`
 }
 
 type SequenceVariant struct {
 	Subject string `yaml:"subject"`
 	Body    string `yaml:"body"`
+	Format  string `yaml:"format,omitempty"` // empty inherits the step format
+	HTML    bool   `yaml:"html,omitempty"`
+}
+
+// normalizeBodyFormat resolves the html alias and validates the format name.
+func normalizeBodyFormat(format string, htmlFlag bool, fallback string) (string, error) {
+	f := strings.ToLower(strings.TrimSpace(format))
+	if f == "" {
+		if htmlFlag {
+			return BodyFormatHTML, nil
+		}
+		return fallback, nil
+	}
+	switch f {
+	case BodyFormatMarkdown, BodyFormatHTML, BodyFormatText:
+		return f, nil
+	}
+	return "", fmt.Errorf("unknown body format %q (use markdown, html, or text)", format)
 }
 
 // ParseSequence reads and parses a sequence YAML file.
@@ -42,7 +77,108 @@ func ParseSequence(path string) (*Sequence, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading sequence file: %w", err)
 	}
-	return ParseSequenceFromBytes(data)
+	seq, err := ParseSequenceFromBytes(data)
+	if err != nil {
+		return nil, err
+	}
+	if err := seq.LoadInlineImages(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
+	return seq, nil
+}
+
+// LoadInlineImages reads any inline image whose data is not yet embedded,
+// resolving relative paths against baseDir, and validates CIDs.
+func (s *Sequence) LoadInlineImages(baseDir string) error {
+	// Discover ![alt](path) and <img src="path"> references to local files and
+	// register them as inline images, rewriting the bodies to cid: references.
+	byPath := map[string]string{}
+	for _, img := range s.InlineImages {
+		if img.Path != "" {
+			byPath[img.Path] = img.CID
+		}
+	}
+	bodies := func(fn func(body *string)) {
+		for i := range s.Steps {
+			fn(&s.Steps[i].Body)
+			for j := range s.Steps[i].Variants {
+				fn(&s.Steps[i].Variants[j].Body)
+			}
+		}
+	}
+	bodies(func(body *string) {
+		for _, ref := range localImageRefs(*body) {
+			if _, ok := byPath[ref]; ok {
+				continue
+			}
+			cid := cidForPath(ref)
+			for n := 2; ; n++ {
+				taken := false
+				for _, existing := range byPath {
+					if existing == cid {
+						taken = true
+						break
+					}
+				}
+				if !taken {
+					break
+				}
+				cid = fmt.Sprintf("%s-%d", cidForPath(ref), n)
+			}
+			byPath[ref] = cid
+			s.InlineImages = append(s.InlineImages, InlineImage{CID: cid, Path: ref})
+		}
+	})
+	if len(byPath) > 0 {
+		bodies(func(body *string) { *body = rewriteImageRefs(*body, byPath) })
+	}
+
+	seen := map[string]bool{}
+	for i := range s.InlineImages {
+		img := &s.InlineImages[i]
+		img.CID = strings.TrimSpace(img.CID)
+		if img.CID == "" {
+			return fmt.Errorf("inline_images[%d]: cid is required", i)
+		}
+		if seen[img.CID] {
+			return fmt.Errorf("inline_images: duplicate cid %q", img.CID)
+		}
+		seen[img.CID] = true
+		if img.Data != "" {
+			if _, err := base64.StdEncoding.DecodeString(img.Data); err != nil {
+				return fmt.Errorf("inline_images[%s]: data is not valid base64: %w", img.CID, err)
+			}
+			if img.ContentType == "" {
+				img.ContentType = "application/octet-stream"
+			}
+			continue
+		}
+		if img.Path == "" {
+			return fmt.Errorf("inline_images[%s]: either path or data is required", img.CID)
+		}
+		p := img.Path
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(baseDir, p)
+		}
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			return fmt.Errorf("inline_images[%s]: reading %s: %w", img.CID, p, err)
+		}
+		if img.ContentType == "" {
+			img.ContentType = mime.TypeByExtension(strings.ToLower(filepath.Ext(p)))
+			if img.ContentType == "" {
+				img.ContentType = http.DetectContentType(raw)
+			}
+		}
+		img.Data = base64.StdEncoding.EncodeToString(raw)
+	}
+	return nil
+}
+
+// SelfContainedYAML re-serializes the sequence with inline image data embedded,
+// so stored campaign content does not depend on files on disk.
+func (s *Sequence) SelfContainedYAML() ([]byte, error) {
+	return yaml.Marshal(s)
 }
 
 // ParseSequenceFromBytes parses sequence YAML from bytes.
@@ -56,12 +192,26 @@ func ParseSequenceFromBytes(data []byte) (*Sequence, error) {
 		return nil, fmt.Errorf("sequence has no steps")
 	}
 
-	for i, step := range seq.Steps {
+	for i := range seq.Steps {
+		step := &seq.Steps[i]
 		if step.Body == "" {
 			return nil, fmt.Errorf("step %d has no body", i+1)
 		}
 		if i == 0 && step.Subject == "" && len(step.Variants) == 0 {
 			return nil, fmt.Errorf("step 1 must have a subject (it starts a new thread)")
+		}
+		format, err := normalizeBodyFormat(step.Format, step.HTML, BodyFormatMarkdown)
+		if err != nil {
+			return nil, fmt.Errorf("step %d: %w", i+1, err)
+		}
+		step.Format, step.HTML = format, false
+		for j := range step.Variants {
+			v := &step.Variants[j]
+			vf, err := normalizeBodyFormat(v.Format, v.HTML, format)
+			if err != nil {
+				return nil, fmt.Errorf("step %d variant %d: %w", i+1, j+1, err)
+			}
+			v.Format, v.HTML = vf, false
 		}
 	}
 

@@ -221,10 +221,19 @@ func CreateCampaign(db *sql.DB, opts CreateCampaignOpts) (*CreateCampaignResult,
 	if opts.SequenceInline != "" {
 		seqContent = []byte(opts.SequenceInline)
 		seq, err = ParseSequenceFromBytes(seqContent)
+		if err == nil {
+			err = seq.LoadInlineImages(".")
+		}
+		if err == nil && len(seq.InlineImages) > 0 {
+			seqContent, err = seq.SelfContainedYAML()
+		}
 	} else {
 		seq, err = ParseSequence(opts.SequenceFile)
 		if err == nil {
 			seqContent, err = os.ReadFile(opts.SequenceFile)
+		}
+		if err == nil && len(seq.InlineImages) > 0 {
+			seqContent, err = seq.SelfContainedYAML()
 		}
 	}
 	if err != nil {
@@ -1922,6 +1931,12 @@ func UpdateCampaign(db *sql.DB, name string, opts UpdateCampaignOpts) error {
 		content, err := os.ReadFile(*opts.SequenceFile)
 		if err != nil {
 			return fmt.Errorf("reading sequence file: %w", err)
+		}
+		if len(newSeq.InlineImages) > 0 {
+			content, err = newSeq.SelfContainedYAML()
+			if err != nil {
+				return fmt.Errorf("embedding inline images: %w", err)
+			}
 		}
 
 		// Validate placeholders against existing campaign leads

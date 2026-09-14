@@ -5,8 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"html"
 	"mime"
 	"net/url"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -19,6 +22,15 @@ type EmailParams struct {
 	CcEmails  []string
 	Subject   string
 	Body      string
+
+	// Format is the Body format: markdown, html, or text (empty means text).
+	Format string
+	// TextBody and HTMLBody are the rendered multipart/alternative parts. When
+	// empty they are derived from Body and Format at build time.
+	TextBody string
+	HTMLBody string
+	// InlineImages are embedded as multipart/related parts addressable via cid:.
+	InlineImages []InlineImage
 
 	// For follow-ups (step 2+)
 	InReplyTo  string // Message-ID of the previous step
@@ -80,11 +92,147 @@ func BuildRFCMessage(p EmailParams) string {
 	}
 
 	msg.WriteString("MIME-Version: 1.0\r\n")
-	msg.WriteString("Content-Type: text/html; charset=utf-8\r\n")
+
+	textBody, htmlBody := RenderBodyParts(p)
+
+	altBoundary := newMIMEBoundary()
+	msg.WriteString(fmt.Sprintf("Content-Type: multipart/alternative; boundary=\"%s\"\r\n", altBoundary))
 	msg.WriteString("\r\n")
-	msg.WriteString(plainTextToHTML(p.Body))
+
+	// text/plain alternative
+	msg.WriteString("--" + altBoundary + "\r\n")
+	msg.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+	msg.WriteString("\r\n")
+	msg.WriteString(textBody)
+	msg.WriteString("\r\n")
+
+	// text/html alternative, wrapped in multipart/related when images are embedded
+	msg.WriteString("--" + altBoundary + "\r\n")
+	if len(p.InlineImages) == 0 {
+		msg.WriteString("Content-Type: text/html; charset=utf-8\r\n")
+		msg.WriteString("\r\n")
+		msg.WriteString(htmlBody)
+		msg.WriteString("\r\n")
+	} else {
+		relBoundary := newMIMEBoundary()
+		msg.WriteString(fmt.Sprintf("Content-Type: multipart/related; boundary=\"%s\"; type=\"text/html\"\r\n", relBoundary))
+		msg.WriteString("\r\n")
+		msg.WriteString("--" + relBoundary + "\r\n")
+		msg.WriteString("Content-Type: text/html; charset=utf-8\r\n")
+		msg.WriteString("\r\n")
+		msg.WriteString(htmlBody)
+		msg.WriteString("\r\n")
+		for _, img := range p.InlineImages {
+			filename := img.Path
+			if filename == "" {
+				filename = img.CID
+			}
+			filename = filepath.Base(filename)
+			msg.WriteString("--" + relBoundary + "\r\n")
+			msg.WriteString(fmt.Sprintf("Content-Type: %s; name=\"%s\"\r\n", img.ContentType, filename))
+			msg.WriteString("Content-Transfer-Encoding: base64\r\n")
+			msg.WriteString(fmt.Sprintf("Content-ID: <%s>\r\n", img.CID))
+			msg.WriteString(fmt.Sprintf("Content-Disposition: inline; filename=\"%s\"\r\n", filename))
+			msg.WriteString("\r\n")
+			msg.WriteString(wrapBase64(img.Data))
+			msg.WriteString("\r\n")
+		}
+		msg.WriteString("--" + relBoundary + "--\r\n")
+	}
+	msg.WriteString("--" + altBoundary + "--\r\n")
 
 	return msg.String()
+}
+
+// RenderBodyParts returns the text/plain and text/html renderings of an email.
+// Pre-rendered TextBody/HTMLBody win; otherwise they are derived from Body
+// according to Format (empty Format means plain text).
+func RenderBodyParts(p EmailParams) (textBody, htmlBody string) {
+	textBody, htmlBody = p.TextBody, p.HTMLBody
+	if textBody != "" && htmlBody != "" {
+		return textBody, htmlBody
+	}
+	t, h := renderBody(p.Body, p.Format)
+	if textBody == "" {
+		textBody = t
+	}
+	if htmlBody == "" {
+		htmlBody = h
+	}
+	return textBody, htmlBody
+}
+
+// renderBody converts a body in the given format to (text, html).
+func renderBody(body, format string) (string, string) {
+	switch format {
+	case BodyFormatMarkdown:
+		h, err := MarkdownToHTML(body)
+		if err != nil {
+			// Never fail a send over markdown rendering; fall back to plain text.
+			return body, plainTextToHTML(body)
+		}
+		return MarkdownToPlainText(body), h
+	case BodyFormatHTML:
+		return htmlToPlainText(body), body
+	default:
+		return body, plainTextToHTML(body)
+	}
+}
+
+// newMIMEBoundary returns a random multipart boundary.
+func newMIMEBoundary() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("coldcli-%d", time.Now().UnixNano())
+	}
+	return "coldcli-" + hex.EncodeToString(b[:])
+}
+
+// wrapBase64 folds base64 text into 76-column lines as required by RFC 2045.
+func wrapBase64(s string) string {
+	var b strings.Builder
+	for len(s) > 76 {
+		b.WriteString(s[:76])
+		b.WriteString("\r\n")
+		s = s[76:]
+	}
+	b.WriteString(s)
+	return b.String()
+}
+
+// referencedInlineImages returns only the images whose cid: appears in body,
+// so steps without a signature do not carry unused attachments.
+func referencedInlineImages(images []InlineImage, body string) []InlineImage {
+	var out []InlineImage
+	for _, img := range images {
+		if strings.Contains(body, "cid:"+img.CID) {
+			out = append(out, img)
+		}
+	}
+	return out
+}
+
+var htmlAnchorRe = regexp.MustCompile(`(?is)<a\b[^>]*\bhref\s*=\s*["\x27]([^"\x27]+)["\x27][^>]*>(.*?)</a>`)
+
+// htmlToPlainText produces a rough text rendering of HTML for snapshots and snippets.
+func htmlToPlainText(s string) string {
+	s = htmlAnchorRe.ReplaceAllStringFunc(s, func(m string) string {
+		parts := htmlAnchorRe.FindStringSubmatch(m)
+		href, text := strings.TrimSpace(parts[1]), strings.TrimSpace(parts[2])
+		if text == "" || text == href {
+			return href
+		}
+		return text + " (" + href + ")"
+	})
+	s = regexp.MustCompile(`(?i)<br\s*/?>`).ReplaceAllString(s, "\n")
+	s = regexp.MustCompile(`(?i)</(p|div|li|tr|h[1-6])>`).ReplaceAllString(s, "\n")
+	s = regexp.MustCompile(`(?s)<[^>]*>`).ReplaceAllString(s, "")
+	s = html.UnescapeString(s)
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSpace(lines[i])
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
 // ValidateEmailParamsHeaders rejects control characters that could create
@@ -148,6 +296,10 @@ func BuildEmailForSend(
 	// Select subject and body based on variant
 	subject := step.Subject
 	body := step.Body
+	format := step.Format
+	if format == "" {
+		format = BodyFormatText
+	}
 
 	if variantIndex > 0 && variantIndex <= len(step.Variants) {
 		v := step.Variants[variantIndex-1]
@@ -156,6 +308,9 @@ func BuildEmailForSend(
 		}
 		if v.Body != "" {
 			body = v.Body
+			if v.Format != "" {
+				format = v.Format
+			}
 		}
 	}
 
@@ -164,7 +319,23 @@ func BuildEmailForSend(
 	// Render templates
 	fromName := RenderTemplate(seq.Defaults.FromName, fields)
 	subject = RenderTemplate(subject, fields)
-	body = RenderTemplate(body, fields)
+
+	// The HTML part is rendered from entity-escaped field values so lead data
+	// cannot inject markup. The text part converts the template to text first
+	// and then substitutes raw values, so lead data is never treated as markup.
+	var htmlSource, textSource string
+	if format == BodyFormatText {
+		body = RenderTemplate(body, fields)
+	} else {
+		escaped := make(map[string]string, len(fields))
+		for k, v := range fields {
+			escaped[k] = html.EscapeString(v)
+		}
+		htmlSource = RenderTemplate(body, escaped)
+		textTemplate, _ := renderBody(body, format)
+		textSource = RenderTemplate(textTemplate, fields)
+		body = RenderTemplate(body, fields)
+	}
 
 	// Strip any remaining unresolved {{variables}}
 	var allStripped []string
@@ -176,14 +347,24 @@ func BuildEmailForSend(
 	allStripped = append(allStripped, stripped...)
 	allStripped = uniqueStrings(allStripped)
 
-	return EmailParams{
+	params := EmailParams{
 		FromName:     fromName,
 		FromEmail:    fromEmail,
 		ToEmail:      lead["email"],
 		Subject:      subject,
 		Body:         body,
+		Format:       format,
 		StrippedVars: allStripped,
 	}
+	if format != BodyFormatText {
+		htmlSource, _ = StripUnresolved(htmlSource)
+		textSource, _ = StripUnresolved(textSource)
+		_, htmlPart := renderBody(htmlSource, format)
+		params.TextBody = textSource
+		params.HTMLBody = htmlPart
+		params.InlineImages = referencedInlineImages(seq.InlineImages, htmlSource)
+	}
+	return params
 }
 
 func mergeTemplateFields(lead map[string]string, sender map[string]string) map[string]string {

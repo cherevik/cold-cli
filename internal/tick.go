@@ -348,9 +348,9 @@ func Tick(cfg TickConfig) (*TickResult, error) {
 			FromEmail:       account.Email,
 			ToEmails:        emailParams.ToEmail,
 			Subject:         emailParams.Subject,
-			TextBody:        emailParams.Body,
-			HTMLBody:        plainTextToHTML(emailParams.Body),
-			Snippet:         emailSnippetFromBody(emailParams.Body),
+			TextBody:        sentTextBody(emailParams),
+			HTMLBody:        sentHTMLBody(emailParams),
+			Snippet:         emailSnippetFromBody(sentTextBody(emailParams)),
 			OccurredAt:      now,
 		}); err != nil {
 			slog.Error("failed to insert sent email message snapshot",
@@ -839,4 +839,16 @@ func FormatTickResult(r *TickResult) string {
 		b.WriteString(strings.Join(parts, ", "))
 	}
 	return b.String()
+}
+
+// sentTextBody returns the plain-text snapshot of an outbound email.
+func sentTextBody(p EmailParams) string {
+	t, _ := RenderBodyParts(p)
+	return t
+}
+
+// sentHTMLBody returns the HTML snapshot of an outbound email.
+func sentHTMLBody(p EmailParams) string {
+	_, h := RenderBodyParts(p)
+	return h
 }
