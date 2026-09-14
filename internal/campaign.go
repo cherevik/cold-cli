@@ -993,11 +993,22 @@ func DeleteCampaign(db *sql.DB, name string) (int64, error) {
 	}
 	defer tx.Rollback()
 
-	tx.Exec("DELETE FROM scheduled_sends WHERE campaign_id = ?", campaignID)
-	tx.Exec("DELETE FROM events WHERE campaign_id = ?", campaignID)
-	tx.Exec("DELETE FROM campaign_leads WHERE campaign_id = ?", campaignID)
-	tx.Exec("DELETE FROM campaign_accounts WHERE campaign_id = ?", campaignID)
-	tx.Exec("DELETE FROM campaigns WHERE id = ?", campaignID)
+	// Child rows first: email_messages references scheduled_sends and events,
+	// so it must go before either. Every statement is checked so a foreign-key
+	// failure aborts the delete instead of leaving an orphaned campaign.
+	for _, stmt := range []string{
+		"DELETE FROM email_messages WHERE campaign_id = ?",
+		"DELETE FROM manual_reply_attempts WHERE campaign_id = ?",
+		"DELETE FROM scheduled_sends WHERE campaign_id = ?",
+		"DELETE FROM events WHERE campaign_id = ?",
+		"DELETE FROM campaign_leads WHERE campaign_id = ?",
+		"DELETE FROM campaign_accounts WHERE campaign_id = ?",
+		"DELETE FROM campaigns WHERE id = ?",
+	} {
+		if _, err := tx.Exec(stmt, campaignID); err != nil {
+			return 0, fmt.Errorf("deleting campaign %d (%s): %w", campaignID, stmt, err)
+		}
+	}
 
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("committing: %w", err)

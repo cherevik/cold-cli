@@ -1204,6 +1204,46 @@ func TestDeleteCampaign(t *testing.T) {
 	}
 }
 
+func TestDeleteCampaign_WithSentSnapshot(t *testing.T) {
+	// A campaign that actually sent has email_messages rows referencing its
+	// scheduled_sends and events. Deleting it must remove those first; the old
+	// code ignored the foreign-key failure and left an orphaned campaign.
+	db := testDB(t)
+	db.Exec("INSERT INTO accounts (email) VALUES ('sender@x.com')")
+	db.Exec("INSERT INTO campaigns (name, status, sequence_file) VALUES ('sent-delete', 'completed', 'seq.yml')")
+	db.Exec("INSERT INTO leads (email, domain) VALUES ('a@x.com', 'x.com')")
+	db.Exec("INSERT INTO campaign_accounts (campaign_id, account_id) VALUES (1, 1)")
+	db.Exec("INSERT INTO campaign_leads (campaign_id, lead_id, status) VALUES (1, 1, 'active')")
+	sentAt := time.Now().UTC().Format(time.RFC3339)
+	db.Exec("INSERT INTO scheduled_sends (campaign_id, lead_id, account_id, step_number, send_at, status) VALUES (1, 1, 1, 1, ?, 'sent')", sentAt)
+	db.Exec("INSERT INTO events (campaign_id, lead_id, account_id, type, step_number, timestamp) VALUES (1, 1, 1, 'sent', 1, ?)", sentAt)
+	sendID := int64(1)
+	if err := insertEmailMessage(db, EmailMessage{
+		CampaignID: 1, LeadID: 1, AccountID: 1,
+		Direction: EmailMessageDirectionOutbound, Type: EmailMessageTypeSent, StepNumber: 1,
+		ScheduledSendID: &sendID, MessageID: "<m1@x.com>", ThreadID: "t1",
+		FromEmail: "sender@x.com", ToEmails: "a@x.com", Subject: "s", TextBody: "b", HTMLBody: "<p>b</p>",
+		OccurredAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("inserting email message: %v", err)
+	}
+
+	if _, err := DeleteCampaign(db, "sent-delete"); err != nil {
+		t.Fatalf("DeleteCampaign: %v", err)
+	}
+	for _, table := range []string{"campaigns", "scheduled_sends", "events", "email_messages", "campaign_leads", "campaign_accounts"} {
+		var count int
+		col := "campaign_id"
+		if table == "campaigns" {
+			col = "id"
+		}
+		db.QueryRow("SELECT COUNT(*) FROM "+table+" WHERE "+col+" = 1").Scan(&count)
+		if count != 0 {
+			t.Errorf("%s: expected 0 rows after delete, got %d", table, count)
+		}
+	}
+}
+
 func TestDeleteCampaign_NotFound(t *testing.T) {
 	db := testDB(t)
 
