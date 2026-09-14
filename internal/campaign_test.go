@@ -1237,7 +1237,7 @@ func TestDeleteCampaign_WithSentSnapshot(t *testing.T) {
 		if table == "campaigns" {
 			col = "id"
 		}
-		db.QueryRow("SELECT COUNT(*) FROM "+table+" WHERE "+col+" = 1").Scan(&count)
+		db.QueryRow("SELECT COUNT(*) FROM " + table + " WHERE " + col + " = 1").Scan(&count)
 		if count != 0 {
 			t.Errorf("%s: expected 0 rows after delete, got %d", table, count)
 		}
