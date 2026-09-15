@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
 	start_date TEXT NOT NULL DEFAULT '',
 	stop_on_reply INTEGER NOT NULL DEFAULT 1,
 	stop_on_domain_reply INTEGER NOT NULL DEFAULT 0,
+	domain_reply_scope TEXT NOT NULL DEFAULT 'campaign',
 	send_window_start TEXT NOT NULL DEFAULT '09:00',
 	send_window_end TEXT NOT NULL DEFAULT '17:00',
 	send_days TEXT NOT NULL DEFAULT '1,2,3,4,5',
@@ -210,6 +211,7 @@ var postgresSchemaStatements = []string{
 		start_date TEXT NOT NULL DEFAULT '',
 		stop_on_reply INTEGER NOT NULL DEFAULT 1,
 		stop_on_domain_reply INTEGER NOT NULL DEFAULT 0,
+		domain_reply_scope TEXT NOT NULL DEFAULT 'campaign',
 		send_window_start TEXT NOT NULL DEFAULT '09:00',
 		send_window_end TEXT NOT NULL DEFAULT '17:00',
 		send_days TEXT NOT NULL DEFAULT '1,2,3,4,5',
@@ -351,6 +353,7 @@ var postgresMigrationStatements = []string{
 	`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS idle_notified_at TIMESTAMPTZ`,
 	`ALTER TABLE email_messages ADD COLUMN IF NOT EXISTS display_body TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE email_messages ADD COLUMN IF NOT EXISTS display_html TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS domain_reply_scope TEXT NOT NULL DEFAULT 'campaign'`,
 }
 
 const (
@@ -452,6 +455,7 @@ func runSQLiteMigrations(db *sql.DB) error {
 		"ALTER TABLE campaigns ADD COLUMN sequence_content TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE campaigns ADD COLUMN start_date TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE scheduled_sends ADD COLUMN error_message TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE campaigns ADD COLUMN domain_reply_scope TEXT NOT NULL DEFAULT 'campaign'",
 	}
 	for _, m := range migrations {
 		if err := withBusyRetry(func() error {

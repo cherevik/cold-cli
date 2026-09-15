@@ -270,6 +270,10 @@ func processReplyMessages(db *sql.DB, accounts []Account, listMessages func(Acco
 					}
 				}
 
+				// A colleague asking us to stop is at least as strong a signal as a
+				// reply, so the campaign's domain stop applies here too.
+				applyDomainReplyStop(db, campaignID, leadID)
+
 				slog.Info("unsubscribe detected",
 					"campaign_id", campaignID, "lead_id", leadID,
 					"lead_email", leadEmail, "message_id", msg.ID)
@@ -307,36 +311,8 @@ func processReplyMessages(db *sql.DB, accounts []Account, listMessages func(Acco
 					"campaign_id", campaignID, "lead_id", leadID, "error", err)
 			}
 
-			// Check stop_on_domain_reply
-			var stopOnDomainReply int
-			queryRowDB(db, "SELECT stop_on_domain_reply FROM campaigns WHERE id = ?", campaignID).Scan(&stopOnDomainReply)
-
-			if stopOnDomainReply != 0 {
-				var domain string
-				queryRowDB(db, "SELECT domain FROM leads WHERE id = ?", leadID).Scan(&domain)
-
-				if domain != "" {
-					if _, err := execDB(db, `
-						UPDATE scheduled_sends SET status = 'skipped'
-						WHERE campaign_id = ?
-						AND lead_id IN (SELECT id FROM leads WHERE domain = ? AND id != ?)
-						AND status = 'pending'`,
-						campaignID, domain, leadID); err != nil {
-						slog.Warn("failed to skip domain sends",
-							"campaign_id", campaignID, "domain", domain, "error", err)
-					}
-
-					if _, err := execDB(db, `
-						UPDATE campaign_leads SET status = 'paused'
-						WHERE campaign_id = ?
-						AND lead_id IN (SELECT id FROM leads WHERE domain = ? AND id != ?)
-						AND status = 'active'`,
-						campaignID, domain, leadID); err != nil {
-						slog.Warn("failed to pause domain leads",
-							"campaign_id", campaignID, "domain", domain, "error", err)
-					}
-				}
-			}
+			// Stop other leads at the same domain (scope: this campaign or the whole workspace)
+			applyDomainReplyStop(db, campaignID, leadID)
 
 			result.Replies++
 		}

@@ -954,6 +954,7 @@ var campaignCreateCmd = &cobra.Command{
 		accountsFlag, _ := cmd.Flags().GetString("accounts")
 		startDate, _ := cmd.Flags().GetString("start-date")
 		sendDays, _ := cmd.Flags().GetString("send-days")
+		stopOnDomainReply, _ := cmd.Flags().GetString("stop-on-domain-reply")
 
 		if name == "" || accountsFlag == "" {
 			return fmt.Errorf("required flags: --name, --accounts")
@@ -968,15 +969,16 @@ var campaignCreateCmd = &cobra.Command{
 		defer db.Close()
 
 		result, err := internal.CreateCampaign(db, internal.CreateCampaignOpts{
-			WorkspaceID:    currentWorkspaceID(),
-			Name:           name,
-			SequenceFile:   seqFile,
-			SequenceInline: seqInline,
-			LeadsFile:      leadsFile,
-			LeadsInline:    leadsInline,
-			AccountEmails:  strings.Split(accountsFlag, ","),
-			StartDate:      startDate,
-			SendDays:       sendDays,
+			WorkspaceID:       currentWorkspaceID(),
+			Name:              name,
+			SequenceFile:      seqFile,
+			SequenceInline:    seqInline,
+			LeadsFile:         leadsFile,
+			LeadsInline:       leadsInline,
+			AccountEmails:     strings.Split(accountsFlag, ","),
+			StartDate:         startDate,
+			SendDays:          sendDays,
+			StopOnDomainReply: stopOnDomainReply,
 		})
 		if err != nil {
 			return err
@@ -1242,6 +1244,11 @@ var campaignUpdateCmd = &cobra.Command{
 			opts.MaxGapSeconds = &v
 			changed = true
 		}
+		if cmd.Flags().Changed("stop-on-domain-reply") {
+			v, _ := cmd.Flags().GetString("stop-on-domain-reply")
+			opts.StopOnDomainReply = &v
+			changed = true
+		}
 		if cmd.Flags().Changed("sequence") {
 			v, _ := cmd.Flags().GetString("sequence")
 			opts.SequenceFile = &v
@@ -1249,7 +1256,7 @@ var campaignUpdateCmd = &cobra.Command{
 		}
 
 		if !changed {
-			return fmt.Errorf("no settings to update — use flags like --sequence, --send-days, --send-window-start, etc.")
+			return fmt.Errorf("no settings to update — use flags like --sequence, --send-days, --send-window-start, --stop-on-domain-reply, etc.")
 		}
 
 		if err := internal.UpdateCampaign(db, name, opts); err != nil {
@@ -1755,6 +1762,7 @@ var campaignStatusCmd = &cobra.Command{
 		fmt.Printf("  timezone:    %s\n", info.Timezone)
 		fmt.Printf("  send window: %s\n", info.SendWindow)
 		fmt.Printf("  send days:   %s\n", info.SendDays)
+		fmt.Printf("  domain stop: %s\n", info.StopOnDomainReply)
 		fmt.Printf("  leads:       %d\n", info.Leads)
 		fmt.Printf("  contacted:   %d\n", info.ContactedLeads)
 		fmt.Printf("  replied:     %d unique leads\n", info.UniqueRepliedLeads)
@@ -2853,6 +2861,7 @@ func init() {
 	campaignCreateCmd.Flags().String("accounts", "", "comma-separated account emails")
 	campaignCreateCmd.Flags().String("start-date", "", "start date (YYYY-MM-DD); default: tomorrow")
 	campaignCreateCmd.Flags().String("send-days", "", "campaign send days override: numbers (0=Sun,1=Mon,...,6=Sat) or names (mon,tue,wed)")
+	campaignCreateCmd.Flags().String("stop-on-domain-reply", "", "when a lead replies, stop other leads at the same domain: off (default), campaign, or workspace (all campaigns in this workspace)")
 	campaignPreviewCmd.Flags().Bool("render", false, "show rendered email content with templates filled in, including stripped placeholder warnings")
 	campaignPreviewCmd.Flags().String("lead", "", "show rendered preview for a specific lead email (use with --render)")
 	campaignUpdateCmd.Flags().String("sequence", "", "path to new sequence YAML file")
@@ -2863,6 +2872,7 @@ func init() {
 	campaignUpdateCmd.Flags().String("timezone", "", "campaign default timezone (e.g. America/New_York); leads with schedule_timezone keep their override")
 	campaignUpdateCmd.Flags().Int("min-gap", 0, "minimum seconds between sends")
 	campaignUpdateCmd.Flags().Int("max-gap", 0, "maximum seconds between sends")
+	campaignUpdateCmd.Flags().String("stop-on-domain-reply", "", "when a lead replies, stop other leads at the same domain: off, campaign, or workspace (all campaigns in this workspace)")
 	campaignCloneCmd.Flags().String("name", "", "new campaign name")
 	campaignCloneCmd.Flags().String("leads", "", "path to leads CSV file (optional per-lead schedule_timezone column supported)")
 	campaignCloneCmd.Flags().String("leads-inline", "", "leads CSV content (alternative to --leads; optional per-lead schedule_timezone column supported)")

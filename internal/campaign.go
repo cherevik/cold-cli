@@ -47,18 +47,19 @@ func ResolveCampaignNameInWorkspace(db *sql.DB, workspaceID, nameOrID string) (s
 
 // CreateCampaignOpts holds options for CreateCampaign.
 type CreateCampaignOpts struct {
-	WorkspaceID     string
-	Name            string
-	SequenceFile    string
-	SequenceInline  string // inline YAML content (alternative to SequenceFile)
-	LeadsFile       string
-	LeadsInline     string // inline CSV content (alternative to LeadsFile)
-	AccountEmails   []string
-	StartDate       string // optional "YYYY-MM-DD"; empty = now
-	SendWindowStart string // optional HH:MM override; empty = config default
-	SendWindowEnd   string // optional HH:MM override; empty = config default
-	SendDays        string // optional send days override for this campaign
-	Timezone        string // optional IANA timezone override; empty = config default
+	WorkspaceID       string
+	Name              string
+	SequenceFile      string
+	SequenceInline    string // inline YAML content (alternative to SequenceFile)
+	LeadsFile         string
+	LeadsInline       string // inline CSV content (alternative to LeadsFile)
+	AccountEmails     []string
+	StartDate         string // optional "YYYY-MM-DD"; empty = now
+	SendWindowStart   string // optional HH:MM override; empty = config default
+	SendWindowEnd     string // optional HH:MM override; empty = config default
+	SendDays          string // optional send days override for this campaign
+	Timezone          string // optional IANA timezone override; empty = config default
+	StopOnDomainReply string // optional "off", "campaign", or "workspace"; empty = off
 }
 
 // CreateCampaignResult is returned by CreateCampaign.
@@ -218,6 +219,11 @@ func CreateCampaign(db *sql.DB, opts CreateCampaignOpts) (*CreateCampaignResult,
 	var seqContent []byte
 	var err error
 
+	stopOnDomainReply, domainReplyScope, err := ParseDomainReplyStop(opts.StopOnDomainReply)
+	if err != nil {
+		return nil, err
+	}
+
 	if opts.SequenceInline != "" {
 		seqContent = []byte(opts.SequenceInline)
 		seq, err = ParseSequenceFromBytes(seqContent)
@@ -333,13 +339,14 @@ func CreateCampaign(db *sql.DB, opts CreateCampaignOpts) (*CreateCampaignResult,
 
 		err := tx.QueryRow(`
 			INSERT INTO campaigns (workspace_id, name, status, sequence_file, sequence_content, start_date, send_window_start, send_window_end,
-				send_days, timezone, min_gap_seconds, max_gap_seconds)
-			VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+				send_days, timezone, min_gap_seconds, max_gap_seconds, stop_on_domain_reply, domain_reply_scope)
+			VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
 			workspaceID, opts.Name, seqFile, string(seqContent),
 			opts.StartDate,
 			sendWindowStart, sendWindowEnd,
 			sendDaysStr, timezone,
 			cfg.MinGapSeconds, cfg.MaxGapSeconds,
+			boolToInt(stopOnDomainReply), domainReplyScope,
 		).Scan(&out.campaignID)
 		if err != nil {
 			if isUniqueConstraintError(err) {
@@ -781,6 +788,7 @@ type CampaignStatusInfo struct {
 	Timezone           string          `json:"timezone"`
 	SendWindow         string          `json:"send_window"`
 	SendDays           string          `json:"send_days"`
+	StopOnDomainReply  string          `json:"stop_on_domain_reply"`
 	Leads              int             `json:"leads"`
 	Accounts           int             `json:"accounts"`
 	TotalSends         int             `json:"total_sends"`
@@ -797,18 +805,20 @@ type CampaignStatusInfo struct {
 // GetCampaignStatus returns campaign details and send counts.
 func GetCampaignStatus(db *sql.DB, name string) (*CampaignStatusInfo, error) {
 	var c struct {
-		ID          int64
-		Status      string
-		SeqFile     string
-		Timezone    string
-		WindowStart string
-		WindowEnd   string
-		SendDays    string
-		CreatedAt   string
+		ID           int64
+		Status       string
+		SeqFile      string
+		Timezone     string
+		WindowStart  string
+		WindowEnd    string
+		SendDays     string
+		StopOnDomain int
+		DomainScope  string
+		CreatedAt    string
 	}
-	err := queryRowDB(db, `SELECT id, status, sequence_file, timezone, send_window_start, send_window_end, send_days, created_at
+	err := queryRowDB(db, `SELECT id, status, sequence_file, timezone, send_window_start, send_window_end, send_days, stop_on_domain_reply, domain_reply_scope, created_at
 		FROM campaigns WHERE name = ?`, name).
-		Scan(&c.ID, &c.Status, &c.SeqFile, &c.Timezone, &c.WindowStart, &c.WindowEnd, &c.SendDays, &c.CreatedAt)
+		Scan(&c.ID, &c.Status, &c.SeqFile, &c.Timezone, &c.WindowStart, &c.WindowEnd, &c.SendDays, &c.StopOnDomain, &c.DomainScope, &c.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("campaign %q not found", name)
 	}
@@ -839,17 +849,18 @@ func GetCampaignStatus(db *sql.DB, name string) (*CampaignStatusInfo, error) {
 	queryRowDB(db, "SELECT COUNT(*) FROM campaign_accounts WHERE campaign_id = ?", c.ID).Scan(&accountCount)
 
 	info := &CampaignStatusInfo{
-		Name:       name,
-		Status:     c.Status,
-		Sequence:   c.SeqFile,
-		Timezone:   c.Timezone,
-		SendWindow: c.WindowStart + " - " + c.WindowEnd,
-		SendDays:   FormatSendDays(c.SendDays),
-		Leads:      leadCount,
-		Accounts:   accountCount,
-		TotalSends: total,
-		SendCounts: counts,
-		CreatedAt:  c.CreatedAt,
+		Name:              name,
+		Status:            c.Status,
+		Sequence:          c.SeqFile,
+		Timezone:          c.Timezone,
+		SendWindow:        c.WindowStart + " - " + c.WindowEnd,
+		SendDays:          FormatSendDays(c.SendDays),
+		StopOnDomainReply: FormatDomainReplyStop(c.StopOnDomain != 0, c.DomainScope),
+		Leads:             leadCount,
+		Accounts:          accountCount,
+		TotalSends:        total,
+		SendCounts:        counts,
+		CreatedAt:         c.CreatedAt,
 	}
 
 	// Campaign performance is measured by unique leads, not message events.
@@ -1038,6 +1049,7 @@ func CloneCampaign(db *sql.DB, opts CloneCampaignOpts) (*CreateCampaignResult, e
 		SeqContent   string
 		StopOnReply  int
 		StopOnDomain int
+		DomainScope  string
 		WindowStart  string
 		WindowEnd    string
 		SendDays     string
@@ -1045,10 +1057,10 @@ func CloneCampaign(db *sql.DB, opts CloneCampaignOpts) (*CreateCampaignResult, e
 		MinGap       int
 		MaxGap       int
 	}
-	err := queryRowDB(db, `SELECT id, sequence_file, sequence_content, stop_on_reply, stop_on_domain_reply,
+	err := queryRowDB(db, `SELECT id, sequence_file, sequence_content, stop_on_reply, stop_on_domain_reply, domain_reply_scope,
 		send_window_start, send_window_end, send_days, timezone, min_gap_seconds, max_gap_seconds
 		FROM campaigns WHERE workspace_id = ? AND name = ?`, workspaceID, opts.SourceName).
-		Scan(&src.ID, &src.SeqFile, &src.SeqContent, &src.StopOnReply, &src.StopOnDomain,
+		Scan(&src.ID, &src.SeqFile, &src.SeqContent, &src.StopOnReply, &src.StopOnDomain, &src.DomainScope,
 			&src.WindowStart, &src.WindowEnd, &src.SendDays, &src.Timezone, &src.MinGap, &src.MaxGap)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("source campaign %q not found in workspace %s", opts.SourceName, workspaceID)
@@ -1141,10 +1153,10 @@ func CloneCampaign(db *sql.DB, opts CloneCampaignOpts) (*CreateCampaignResult, e
 		var out cloneResult
 
 		err := tx.QueryRow(`
-			INSERT INTO campaigns (workspace_id, name, status, sequence_file, sequence_content, start_date, stop_on_reply, stop_on_domain_reply,
+			INSERT INTO campaigns (workspace_id, name, status, sequence_file, sequence_content, start_date, stop_on_reply, stop_on_domain_reply, domain_reply_scope,
 				send_window_start, send_window_end, send_days, timezone, min_gap_seconds, max_gap_seconds)
-			VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-			workspaceID, opts.NewName, src.SeqFile, src.SeqContent, opts.StartDate, src.StopOnReply, src.StopOnDomain,
+			VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+			workspaceID, opts.NewName, src.SeqFile, src.SeqContent, opts.StartDate, src.StopOnReply, src.StopOnDomain, src.DomainScope,
 			src.WindowStart, src.WindowEnd, src.SendDays, src.Timezone, src.MinGap, src.MaxGap,
 		).Scan(&out.campaignID)
 		if err != nil {
@@ -1871,14 +1883,15 @@ func RetryCampaign(db *sql.DB, name string, step *int) (*RetryCampaignResult, er
 
 // UpdateCampaignOpts holds fields to update. Zero values are ignored.
 type UpdateCampaignOpts struct {
-	StartDate       *string
-	SendWindowStart *string
-	SendWindowEnd   *string
-	SendDays        *string
-	Timezone        *string
-	MinGapSeconds   *int
-	MaxGapSeconds   *int
-	SequenceFile    *string // path to new sequence YAML
+	StartDate         *string
+	SendWindowStart   *string
+	SendWindowEnd     *string
+	SendDays          *string
+	Timezone          *string
+	MinGapSeconds     *int
+	MaxGapSeconds     *int
+	SequenceFile      *string // path to new sequence YAML
+	StopOnDomainReply *string // "off", "campaign", or "workspace"
 }
 
 // UpdateCampaign updates campaign settings with validation.
@@ -1907,6 +1920,15 @@ func UpdateCampaign(db *sql.DB, name string, opts UpdateCampaignOpts) error {
 	if opts.SendDays != nil {
 		if _, err := ParseSendDays(*opts.SendDays); err != nil {
 			return fmt.Errorf("invalid send_days: %w", err)
+		}
+	}
+	var newStopOnDomainReply bool
+	var newDomainReplyScope string
+	if opts.StopOnDomainReply != nil {
+		var err error
+		newStopOnDomainReply, newDomainReplyScope, err = ParseDomainReplyStop(*opts.StopOnDomainReply)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -2073,6 +2095,16 @@ func UpdateCampaign(db *sql.DB, name string, opts UpdateCampaignOpts) error {
 			col string
 			val any
 		}{"max_gap_seconds", *opts.MaxGapSeconds})
+	}
+	if opts.StopOnDomainReply != nil {
+		updates = append(updates, struct {
+			col string
+			val any
+		}{"stop_on_domain_reply", boolToInt(newStopOnDomainReply)})
+		updates = append(updates, struct {
+			col string
+			val any
+		}{"domain_reply_scope", newDomainReplyScope})
 	}
 	if opts.SequenceFile != nil {
 		updates = append(updates, struct {

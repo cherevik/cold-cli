@@ -38,6 +38,7 @@ type Campaign struct {
 	SequenceFile      string    `json:"sequence_file"`
 	StopOnReply       bool      `json:"stop_on_reply"`
 	StopOnDomainReply bool      `json:"stop_on_domain_reply"`
+	DomainReplyScope  string    `json:"domain_reply_scope"`
 	SendWindowStart   string    `json:"send_window_start"`
 	SendWindowEnd     string    `json:"send_window_end"`
 	SendDays          string    `json:"send_days"`
